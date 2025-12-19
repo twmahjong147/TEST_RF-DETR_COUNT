@@ -3,6 +3,64 @@ import supervision as sv
 from inference import get_model
 from PIL import Image
 from collections import Counter
+import numpy as np
+
+
+def filter_area_outliers(detections, labels, std_factor=2):
+    """
+    Filters out detections whose bounding box area is an outlier (outside mean ± std_factor*std).
+    Returns filtered detections and labels.
+    """
+    import numpy as np
+
+    # Prefer using supervision's Detections.xyxy when available
+    try:
+        # If detections is a supervision.Detections object
+        boxes = np.array(detections.xyxy)
+        get_subset = lambda idxs: detections[idxs]
+    except Exception:
+        # Fallback: detections may be a list/ndarray of tuples/arrays
+        boxes = np.array([
+            (det.xyxy if hasattr(det, 'xyxy') else det[:4])
+            for det in detections
+        ])
+        def get_subset(idxs):
+            if isinstance(detections, np.ndarray):
+                return detections[idxs]
+            return [detections[i] for i in idxs]
+
+    if boxes.size == 0 or len(boxes) == 0:
+        return detections, labels
+
+    x_min = boxes[:, 0].astype(float)
+    y_min = boxes[:, 1].astype(float)
+    x_max = boxes[:, 2].astype(float)
+    y_max = boxes[:, 3].astype(float)
+
+    widths = x_max - x_min
+    heights = y_max - y_min
+    areas = widths * heights
+
+    mean_area = areas.mean()
+    std_area = areas.std()
+
+    if std_area == 0 or np.isnan(std_area):
+        # Nothing to filter if no variance
+        filtered_indices = list(range(len(areas)))
+    else:
+        filtered_indices = [
+            int(i) for i, area in enumerate(areas)
+            if abs(area - mean_area) <= std_factor * std_area
+        ]
+
+    if not filtered_indices:
+        # Return empty of the same type as input
+        return get_subset(np.array([], dtype=int)), []
+
+    filtered_detections = get_subset(filtered_indices)
+    filtered_labels = [labels[i] for i in filtered_indices]
+    return filtered_detections, filtered_labels
+
 
 SAMPLES_DIR = "samples"
 OUTPUT_DIR = "annotated_samples"
@@ -37,7 +95,7 @@ for filename in os.listdir(SAMPLES_DIR):
     output_path = os.path.join(OUTPUT_DIR, f"annotated_{filename}")
     annotated_image.save(output_path)
     print(f"Annotated image saved to {output_path}")
-
+    pruned_class_counts = {}
     # Generate and save per-class annotated images
     for class_name in set(labels):
         # Filter detections and labels for this class
@@ -47,6 +105,13 @@ for filename in os.listdir(SAMPLES_DIR):
         # Filter detections for this class
         class_detections = detections[indices]
         class_labels = [labels[i] for i in indices]
+
+        # Filter out area outliers using mean and std
+        class_detections, class_labels = filter_area_outliers(class_detections, class_labels, std_factor=2)
+        pruned_class_counts[class_name] = len(class_detections)
+        if len(class_detections) == 0:
+            continue
+
         class_annotated_image = image.copy()
         class_annotated_image = sv.BoxAnnotator(
             color=sv.ColorPalette.ROBOFLOW
@@ -69,7 +134,7 @@ for filename in os.listdir(SAMPLES_DIR):
     print("\nClass counts (descending):")
     output_lines = ["Class counts (descending):\n"]
     for class_name, count in class_counts.most_common():
-        line = f"{class_name}: {count}"
+        line = f"{class_name}: {count}, Pruned: {pruned_class_counts.get(class_name, 0)}"
         print(line)
         output_lines.append(line + "\n")
     # Save to file
@@ -78,4 +143,3 @@ for filename in os.listdir(SAMPLES_DIR):
     with open(counts_output_path, "w") as f:
         f.writelines(output_lines)
     print(f"Class counts saved to {counts_output_path}")
-
