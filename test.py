@@ -62,6 +62,74 @@ def filter_area_outliers(detections, labels, std_factor=2):
     return filtered_detections, filtered_labels
 
 
+def remove_contained_detections(detections, labels, ioa_thresh=1.0):
+    """
+    Remove detections that are (almost) totally contained inside another detection.
+    Uses IoA (intersection over area of the smaller box) and keeps the larger-area
+    box when there is containment. Returns filtered (detections, labels) in the
+    same types as the inputs where possible.
+    """
+    import numpy as np
+
+    try:
+        boxes = np.array(detections.xyxy)
+        get_subset = lambda idxs: detections[idxs]
+    except Exception:
+        boxes = np.array([
+            (det.xyxy if hasattr(det, 'xyxy') else det[:4])
+            for det in detections
+        ])
+
+        def get_subset(idxs):
+            if isinstance(detections, np.ndarray):
+                return detections[idxs]
+            return [detections[i] for i in idxs]
+
+    if boxes.size == 0 or len(boxes) == 0:
+        return detections, labels
+
+    x1 = boxes[:, 0].astype(float)
+    y1 = boxes[:, 1].astype(float)
+    x2 = boxes[:, 2].astype(float)
+    y2 = boxes[:, 3].astype(float)
+
+    widths = (x2 - x1).clip(min=0.0)
+    heights = (y2 - y1).clip(min=0.0)
+    areas = widths * heights
+
+    # pairwise intersection
+    xi1 = np.maximum(x1[:, None], x1[None, :])
+    yi1 = np.maximum(y1[:, None], y1[None, :])
+    xi2 = np.minimum(x2[:, None], x2[None, :])
+    yi2 = np.minimum(y2[:, None], y2[None, :])
+
+    inter_w = np.maximum(0.0, xi2 - xi1)
+    inter_h = np.maximum(0.0, yi2 - yi1)
+    inter = inter_w * inter_h
+
+    eps = 1e-6
+    ioa = inter / (areas[:, None] + eps)
+
+    # zero self IoA
+    np.fill_diagonal(ioa, 0.0)
+
+    # prefer keeping larger-area box when contained
+    area_cmp = areas[None, :] >= areas[:, None]
+    cond = (ioa >= float(ioa_thresh)) & area_cmp
+
+    remove_mask = cond.any(axis=1)
+    keep_mask = ~remove_mask
+
+    if keep_mask.sum() == len(keep_mask):
+        return detections, labels
+
+    keep_indices = np.where(keep_mask)[0].astype(int)
+
+    filtered_detections = get_subset(keep_indices)
+    filtered_labels = [labels[i] for i in keep_indices]
+    return filtered_detections, filtered_labels
+
+
 SAMPLES_DIR = "samples"
 OUTPUT_DIR = "annotated_samples"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -108,6 +176,10 @@ for filename in os.listdir(SAMPLES_DIR):
 
         # Filter out area outliers using mean and std
         class_detections, class_labels = filter_area_outliers(class_detections, class_labels, std_factor=2)
+
+        # Remove detections that are contained in another detection (IoA-based)
+        class_detections, class_labels = remove_contained_detections(class_detections, class_labels, ioa_thresh=0.75)
+
         pruned_class_counts[class_name] = len(class_detections)
         if len(class_detections) == 0:
             continue
